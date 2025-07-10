@@ -78,6 +78,7 @@ def run_pta_group(base_path, sdate, edate, fee_rate, capital, pnl_hzs=pnl_hzs, a
     results = {}
     directories = [root for root, _, files in os.walk(base_path) if files]
     num_parallel_inner = max(1, num_parallel // n_process)  # 控制内部并行度
+
     with ProcessPoolExecutor(max_workers=n_process) as executor:
         future_to_path = {executor.submit(process_directory, root, base_path, sdate, edate, fee_rate, capital, pnl_hzs, account_name, beta_dict, num_parallel_inner, suffix): root for root in directories}
         
@@ -520,12 +521,12 @@ def gen_result(in_fns, sdate, edate, fee_rate, pnl_hzs=pnl_hzs, account_name='bi
         return None
 
 
-def analyze_slurm_sim(sdate, edate, sim_name, fee_rate = -0.3e-4, capital = 1e6):
-    parent_folder = '/mnt/sda/NAS/ShareFolder/bb/sim_slurm/'
-
+def analyze_slurm_sim(sdate, edate, sim_name, fee_rate=-0.3e-4, capital=1e6,
+                      parent_folder='/mnt/sda/NAS/ShareFolder/bb/sim_slurm/',
+                      suffix='.log', num_parallel=256, output_folder=f'/mnt/sda/NAS/ShareFolder/bb/sim_slurm/'):
     folder = parent_folder + sim_name
 
-    df_res = run_pta_group(folder, sdate, edate, fee_rate, capital, suffix='.log', num_parallel=256, n_process=2)
+    df_res = run_pta_group(folder, sdate, edate, fee_rate, capital, suffix=suffix, num_parallel=num_parallel, n_process=2)
 
     df_res = df_res.sort_index()
     df_res.columns = ['_'.join(col) for col in df_res.columns]
@@ -534,7 +535,9 @@ def analyze_slurm_sim(sdate, edate, sim_name, fee_rate = -0.3e-4, capital = 1e6)
     df_res['score'] = df_res.eval('total_pnl_sharpe * (2 * total_pnl_win_ratio - 1) * sqrt(1+te)') #score calc
     #df_res['score'] = df_res.eval('total_pnl_sharpe * (2 * total_pnl_win_ratio - 1) * log(1+te)') #score calc
     df_res = df_res.sort_values('score', ascending=False)[['score'] + cols].copy() #.query('total_pnl_win_ratio >= 0.6')
-    df_res.to_parquet(f'/mnt/sda/NAS/ShareFolder/bb/sim_slurm/{sim_name}/df_res.parquet')
+    output_folder = output_folder + f'{sim_name}'
+    os.system(f'mkdir -p {output_folder}')
+    df_res.to_parquet(f'{output_folder}/df_res.parquet')
     return df_res
 
 
