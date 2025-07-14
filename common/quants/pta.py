@@ -3,6 +3,8 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
+import gzip
+import ast
 
 from common.log_parser import LogParser
 
@@ -11,6 +13,8 @@ from common.miscs.html import pph
 from common.quants.corr import pair_corr, calc_auto_corr, bucket_analyze_generic
 from common.quants.pnl import sharpe, win_ratio, calc_trade_markout, n_count
 import matplotlib.pyplot as plt
+
+from common.searchParams.utils import calc_trading_metrics
 
 beta_dict = {
     'BTCUSDT.BNF': 1.0,
@@ -25,6 +29,40 @@ beta_dict = {
 }
 
 pnl_hzs = [10, 60, 300, 1800, 7200, 1e9]
+
+def parse_with_logparser(log_path, out_dir,
+                         sdate, edate,
+                         analyze_latency=True, exchange="binance"):
+    os.makedirs(out_dir, exist_ok=True)
+    parser = LogParser([log_path],
+                       analyze_latency=analyze_latency,
+                       exchange=exchange)
+    df_order, df_panel = parser.get_order_and_panel(sdate, edate)
+
+    df_panel.index.name = "ts"
+    df_panel.to_parquet(f"{out_dir}/panel.parquet")
+    print(f"[panel] wrote {len(df_panel)} rows → {out_dir}/panel.parquet")
+
+    df_order = df_order.set_index("time").sort_index()
+    df_order.index.name = "ts"
+    df_order.to_parquet(f"{out_dir}/orders.parquet")
+    print(f"[orders] wrote {len(df_order)} events → {out_dir}/orders.parquet")
+
+
+def parse_logs_to_parquet(logs_root, parquet_root, sdate, edate, suffix=".log.gz"):
+    for root, _, files in os.walk(logs_root):
+        logs = [f for f in files if f.endswith(suffix)]
+        if not logs:
+            continue
+
+        rel = os.path.relpath(root, logs_root)
+        for fn in logs:
+            lp = os.path.join(root, fn)
+            od = os.path.join(parquet_root, rel, fn[:-len(suffix)])
+            print(f"\n→ parsing {lp} → {od}")
+
+            parse_with_logparser(lp, od, sdate, edate)
+
 
 
 def process_directory(root, base_path, sdate, edate, fee_rate, capital, pnl_hzs, account_name, beta_dict, num_parallel_inner, suffix):
@@ -521,24 +559,130 @@ def gen_result(in_fns, sdate, edate, fee_rate, pnl_hzs=pnl_hzs, account_name='bi
         return None
 
 
-def analyze_slurm_sim(sdate, edate, sim_name, fee_rate=-0.3e-4, capital=1e6,
-                      parent_folder='/mnt/sda/NAS/ShareFolder/bb/sim_slurm/',
-                      suffix='.log', num_parallel=256, output_folder=f'/mnt/sda/NAS/ShareFolder/bb/sim_slurm/'):
-    folder = parent_folder + sim_name
 
-    df_res = run_pta_group(folder, sdate, edate, fee_rate, capital, suffix=suffix, num_parallel=num_parallel, n_process=2)
+def summarize_one_sim(sim_dir, fee_rate, pnl_hzs, account_name,sdate=None, edate=None):
+    date_dirs = sorted([
+        d for d in glob.glob(os.path.join(sim_dir, "*"))
+        if os.path.isdir(d)
+    ])
+    if not date_dirs:
+        raise RuntimeError(f"No date subdirs in {sim_dir}")
 
-    df_res = df_res.sort_index()
-    df_res.columns = ['_'.join(col) for col in df_res.columns]
-    cols = 'total_pnl_sharpe total_pnl_win_ratio total_pnl_sum total_pnl_mean total_pnl_std total_pnl_min notional_mean gross_book_mean_mean net_book_mean_mean'.split()
-    df_res['te'] = df_res.eval('notional_mean / gross_book_mean_mean')
-    df_res['score'] = df_res.eval('total_pnl_sharpe * (2 * total_pnl_win_ratio - 1) * sqrt(1+te)') #score calc
-    #df_res['score'] = df_res.eval('total_pnl_sharpe * (2 * total_pnl_win_ratio - 1) * log(1+te)') #score calc
-    df_res = df_res.sort_values('score', ascending=False)[['score'] + cols].copy() #.query('total_pnl_win_ratio >= 0.6')
-    output_folder = output_folder + f'{sim_name}'
-    os.system(f'mkdir -p {output_folder}')
-    df_res.to_parquet(f'{output_folder}/df_res.parquet')
+    orders = pd.concat(
+        [pd.read_parquet(os.path.join(d, "orders.parquet")) for d in date_dirs],
+        axis=0
+    ).sort_index()
+    panel  = pd.concat(
+        [pd.read_parquet(os.path.join(d, "panel.parquet"))  for d in date_dirs],
+        axis=0
+    ).sort_index()
+
+    if sdate is not None:
+        start = pd.to_datetime(sdate)
+        end   = pd.to_datetime(edate) + pd.Timedelta("1D")
+        orders = orders.loc[start:end]
+        panel  = panel.loc[start:end]
+
+    metric_df, _ = calc_trading_metrics(
+        {"order": orders, "panel": panel},
+        fee_rate, pnl_hzs, account_name=account_name
+    )
+
+    df_tm = metric_df.reset_index().set_index(["instr","date"])
+    total_by_date = (
+        df_tm
+        .groupby("date")
+        .sum()                    
+        .assign(instr="Total")     
+        .reset_index()
+        .set_index(["instr","date"])
+    )
+    df_tm = pd.concat([df_tm, total_by_date])\
+              .sort_index(level=[0,1], ascending=[True, False])
+
+    basic_agg = ["sum","mean","std","min","max"]
+    extra_agg = [sharpe, win_ratio] + basic_agg
+
+    pnl_part   = df_tm[["total_pnl"]].groupby("instr").agg(extra_agg)
+    trade_part = df_tm[["notional","gross_book_mean","net_book_mean"]].groupby("instr").agg(basic_agg)
+
+    concat_df = pd.concat([pnl_part, trade_part], axis=1)
+
+    return concat_df.loc["Total"]  
+
+def analyze_slurm_sim(
+    sdate, edate, sim_name,
+    fee_rate=-0.3e-4,
+    capital=1e6,
+    parent_folder="/mnt/sda/NAS/ShareFolder/bb/sim_slurm/",
+    suffix=".log",
+    num_parallel=8,
+    output_folder="/mnt/sda/NAS/ShareFolder/bb/sim_slurm/"
+):
+    logs_root    = os.path.join(parent_folder, sim_name)
+    parquet_root = os.path.join(output_folder, sim_name)
+
+    if not os.path.isdir(parquet_root) or not os.listdir(parquet_root):
+        print(f"No parquet directory at {parquet_root}; parsing logs → parquet…")
+        os.makedirs(parquet_root, exist_ok=True)
+        parse_logs_to_parquet(logs_root, parquet_root, sdate=sdate, edate=edate, suffix=suffix)
+    else:
+        print(f"Parquet directory {parquet_root} exists; skipping parsing.")
+
+    sim_dirs = sorted(glob.glob(os.path.join(parquet_root, "sim@*")))
+    results = {}
+    with ProcessPoolExecutor(max_workers=num_parallel) as exe:
+        futures = {
+            exe.submit(summarize_one_sim, d, fee_rate, pnl_hzs, "bin1", sdate, edate): d
+            for d in sim_dirs
+        }
+        for fut in as_completed(futures):
+            simdir = futures[fut]
+            sim     = os.path.basename(simdir)
+            results[sim] = fut.result()
+
+    df_res = pd.DataFrame.from_dict(results, orient="index")
+    df_res.columns = ["_".join(col) for col in df_res.columns]
+
+    df_res["te"]    = df_res["notional_mean"] / df_res["gross_book_mean_mean"]
+    df_res["score"] = (
+        df_res["total_pnl_sharpe"]
+        * (2 * df_res["total_pnl_win_ratio"] - 1)
+        * np.sqrt(1 + df_res["te"])
+    )
+
+    cols = [
+        "total_pnl_sharpe", "total_pnl_win_ratio",
+        "total_pnl_sum",    "total_pnl_mean",   
+        "total_pnl_std",    "total_pnl_min",
+        "notional_mean",    "gross_book_mean_mean", "net_book_mean_mean"
+    ]
+    df_res = df_res.sort_values("score", ascending=False)[["score"] + cols]
+
+    out_dir = os.path.join(output_folder, sim_name)
+    os.makedirs(out_dir, exist_ok=True)
+    df_res.reset_index(drop=False).to_parquet(os.path.join(out_dir, "df_res.parquet"))
+
     return df_res
+
+# def analyze_slurm_sim(sdate, edate, sim_name, fee_rate=-0.3e-4, capital=1e6,
+#                       parent_folder='/mnt/sda/NAS/ShareFolder/bb/sim_slurm/',
+#                       suffix='.log', num_parallel=256, output_folder=f'/mnt/sda/NAS/ShareFolder/bb/sim_slurm/'):
+#     folder = parent_folder + sim_name
+
+#     df_res = run_pta_group(folder, sdate, edate, fee_rate, capital, suffix=suffix, num_parallel=num_parallel, n_process=2)
+
+#     df_res = df_res.sort_index()
+#     df_res.columns = ['_'.join(col) for col in df_res.columns]
+#     cols = 'total_pnl_sharpe total_pnl_win_ratio total_pnl_sum total_pnl_mean total_pnl_std total_pnl_min notional_mean gross_book_mean_mean net_book_mean_mean'.split()
+#     df_res['te'] = df_res.eval('notional_mean / gross_book_mean_mean')
+#     df_res['score'] = df_res.eval('total_pnl_sharpe * (2 * total_pnl_win_ratio - 1) * sqrt(1+te)') #score calc
+#     #df_res['score'] = df_res.eval('total_pnl_sharpe * (2 * total_pnl_win_ratio - 1) * log(1+te)') #score calc
+#     df_res = df_res.sort_values('score', ascending=False)[['score'] + cols].copy() #.query('total_pnl_win_ratio >= 0.6')
+#     output_folder = output_folder + f'{sim_name}'
+#     os.system(f'mkdir -p {output_folder}')
+#     df_res.to_parquet(f'{output_folder}/df_res.parquet')
+#     return df_res
 
 
 

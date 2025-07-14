@@ -1,13 +1,15 @@
+import os
+
 from common.quants.pta import analyze_slurm_sim
 
 def main():
+    repo_root = os.path.dirname(os.path.abspath(__file__))
     sdate       = '2024-12-03'
     edate       = '2025-12-06'
     sim_name    = 'sim'
-    parent_dir  = '/home/shroy/Desktop/python1/nblg_py_common/common/data_sample/'
-    output_dir  = '/home/shroy/Desktop/python1/nblg_py_common/output/'
-
-    import os
+    parent_dir = os.path.join(repo_root, "common", "data_sample")
+    output_dir = os.path.join(repo_root, "output", "parquet")
+    
     os.makedirs(output_dir, exist_ok=True)
 
     df_res = analyze_slurm_sim(
