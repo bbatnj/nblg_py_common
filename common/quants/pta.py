@@ -35,8 +35,7 @@ def parse_with_logparser(log_path, out_dir,
                          analyze_latency=True, exchange="binance"):
     os.makedirs(out_dir, exist_ok=True)
     parser = LogParser([log_path],
-                       analyze_latency=analyze_latency,
-                       exchange=exchange)
+                       analyze_latency=analyze_latency)
     df_order, df_panel = parser.get_order_and_panel(sdate, edate)
 
     df_panel.index.name = "ts"
