@@ -27,3 +27,6 @@ dist/
 
 # Parquet / output folders (unless you explicitly want to check them in)
 output/
+
+# Driver code for testing
+run_analysis.py

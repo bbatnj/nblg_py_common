@@ -610,10 +610,11 @@ def gen_result(in_fns, sdate, edate, fee_rate,
         df_order_list, df_panel_list = [], []
         order_stats = {}                            
 
+        suffix = ".log.gz"
         for fn in in_fns:
             repo_root = "/home/shroy/Desktop/python1/nblg_py_common"
             rel_dir   = pathlib.Path(fn).parent.name           
-            stem      = pathlib.Path(fn).stem                  
+            stem      = pathlib.Path(fn).name[:-len(suffix)]   
             pdir      = pathlib.Path(repo_root) / "output/parquet/sim" / rel_dir / stem
 
             paths = {
@@ -627,6 +628,7 @@ def gen_result(in_fns, sdate, edate, fee_rate,
                 break
 
             tm = pd.read_parquet(paths["trade_metric"])
+            
             if "instr" not in tm.columns:            
                 tm = tm.reset_index()               
             tm_frames.append(tm)
@@ -635,18 +637,19 @@ def gen_result(in_fns, sdate, edate, fee_rate,
                 kind_frames[k].append(pd.read_parquet(paths[k]))
 
             dfo, dfp = read_order_panel_if_exist(fn, sdate, edate)
-            if dfo is None:
+            if dfo is None or dfp is None:
                 cache_ok = False
                 break
             df_order_list.append(dfo)
             df_panel_list.append(dfp)
 
+        cache_ok = False
         # cache hit
         if cache_ok:
             print(f"[cache hit] loaded artefacts for {len(in_fns)} file(s)")
 
             trade_metric = pd.concat(tm_frames, ignore_index=True)
-
+            print(trade_metric)
             instr2dfs_full = defaultdict(dict)
             for kind, frames in kind_frames.items():
                 big = pd.concat(frames)              
@@ -657,7 +660,7 @@ def gen_result(in_fns, sdate, edate, fee_rate,
 
             return {
                 "order_stats": order_stats,          
-                "trade_metric": trade_metric,
+                "trade_metric": trade_metric.reset_index(),
                 "instr2dfs": instr2dfs_full,
                 "df_order": pd.concat(df_order_list).sort_index(),
                 "df_panel": pd.concat(df_panel_list).sort_index(),
@@ -687,14 +690,9 @@ def gen_result(in_fns, sdate, edate, fee_rate,
 
 
 
-def analyze_slurm_sim(
-    sdate, edate, sim_name,
-    fee_rate=-0.3e-4,
-    capital=1e6,
+def analyze_slurm_sim(sdate, edate, sim_name, fee_rate=-0.3e-4, capital=1e6,
     parent_folder="/mnt/sda/NAS/ShareFolder/bb/sim_slurm/",
-    suffix=".log.gz",
-    num_parallel=8,
-    output_folder="/mnt/sda/NAS/ShareFolder/bb/sim_slurm/"
+    suffix=".log.gz", num_parallel=256, output_folder="/mnt/sda/NAS/ShareFolder/bb/sim_slurm/"
 ):
     logs_root    = os.path.join(parent_folder, sim_name)
     parquet_root = os.path.join(output_folder, sim_name)
@@ -713,8 +711,6 @@ def analyze_slurm_sim(
     df_res = df_res.sort_index()
     df_res.columns = ['_'.join(col) for col in df_res.columns]
     cols = 'total_pnl_sharpe total_pnl_win_ratio total_pnl_sum total_pnl_mean total_pnl_std total_pnl_min notional_mean gross_book_mean_mean net_book_mean_mean'.split()
-
-    print("df_res columns:", list(df_res.columns))
     df_res['te'] = df_res.eval('notional_mean / gross_book_mean_mean')
     df_res['score'] = df_res.eval('total_pnl_sharpe * (2 * total_pnl_win_ratio - 1) * sqrt(1+te)') #score calc
     #df_res['score'] = df_res.eval('total_pnl_sharpe * (2 * total_pnl_win_ratio - 1) * log(1+te)') #score calc
@@ -723,25 +719,6 @@ def analyze_slurm_sim(
     os.system(f'mkdir -p {output_folder}')
     df_res.to_parquet(f'{output_folder}/df_res.parquet')
     return df_res
-
-# def analyze_slurm_sim(sdate, edate, sim_name, fee_rate=-0.3e-4, capital=1e6,
-#                       parent_folder='/mnt/sda/NAS/ShareFolder/bb/sim_slurm/',
-#                       suffix='.log', num_parallel=256, output_folder=f'/mnt/sda/NAS/ShareFolder/bb/sim_slurm/'):
-#     folder = os.path.join(parent_folder, sim_name)
-
-#     df_res = run_pta_group(folder, sdate, edate, fee_rate, capital, suffix=suffix, num_parallel=num_parallel, n_process=2)
-
-#     df_res = df_res.sort_index()
-#     df_res.columns = ['_'.join(col) for col in df_res.columns]
-#     cols = 'total_pnl_sharpe total_pnl_win_ratio total_pnl_sum total_pnl_mean total_pnl_std total_pnl_min notional_mean gross_book_mean_mean net_book_mean_mean'.split()
-#     df_res['te'] = df_res.eval('notional_mean / gross_book_mean_mean')
-#     df_res['score'] = df_res.eval('total_pnl_sharpe * (2 * total_pnl_win_ratio - 1) * sqrt(1+te)') #score calc
-#     #df_res['score'] = df_res.eval('total_pnl_sharpe * (2 * total_pnl_win_ratio - 1) * log(1+te)') #score calc
-#     df_res = df_res.sort_values('score', ascending=False)[['score'] + cols].copy() #.query('total_pnl_win_ratio >= 0.6')
-#     output_folder = output_folder + f'{sim_name}'
-#     os.system(f'mkdir -p {output_folder}')
-#     df_res.to_parquet(f'{output_folder}/df_res.parquet')
-#     return df_res
 
 
 
