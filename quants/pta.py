@@ -3,8 +3,6 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
-import pathlib
-from collections import defaultdict
 
 from common.log_parser import LogParser
 
@@ -27,107 +25,6 @@ beta_dict = {
 }
 
 pnl_hzs = [10, 60, 300, 1800, 7200, 1e9]
-
-def read_order_panel_if_exist(log_path, sdate=None, edate=None):
-    REPO_ROOT    = "/home/shroy/Desktop/python1/nblg_py_common"
-    LOGS_ROOT    = os.path.join(REPO_ROOT, "common", "data_sample", "sim")
-    PARQUET_ROOT = os.path.join(REPO_ROOT, "output", "parquet", "sim")
-    LOG_SUFFIX   = ".log.gz"
-
-    rel  = pathlib.Path(log_path).parent.name          
-    stem = pathlib.Path(log_path).name[:-len(LOG_SUFFIX)]
-
-    pdir = os.path.join(PARQUET_ROOT, rel, stem)
-    panel_pq  = os.path.join(pdir, "panel.parquet")
-    orders_pq = os.path.join(pdir, "orders.parquet")
-
-    if not (os.path.exists(panel_pq) and os.path.exists(orders_pq)):
-        return None, None        
-    df_panel = pd.read_parquet(panel_pq)
-    df_order = pd.read_parquet(orders_pq)
-
-    if sdate:
-        start = pd.to_datetime(sdate)
-        end   = pd.to_datetime(edate) + pd.Timedelta("1D")
-        df_panel = df_panel.loc[start:end]
-        df_order = df_order.loc[start:end]
-
-    for _df in (df_order, df_panel):
-        _df.index.name = "ts"
-
-    return df_order, df_panel
-
-
-
-def parse_with_logparser(
-    log_path, out_dir, fee_rate,
-    sdate, edate,
-    analyze_latency=True, exchange="binance",
-    pnl_hzs=pnl_hzs, account_name="bin1",
-):
-    os.makedirs(out_dir, exist_ok=True)
-
-    targets = ["panel.parquet", "orders.parquet",
-               "trade_metric.parquet", "pnl.parquet",
-               "auto_corr.parquet", "fills.parquet"]
-    if all((pathlib.Path(out_dir) / f).exists() for f in targets):
-        print(f"[skip] all caches present → {out_dir}")
-        return
-
-    parser = LogParser([log_path], analyze_latency=analyze_latency,
-                       exchange=exchange)
-    df_order, df_panel = parser.get_order_and_panel(sdate, edate)
-
-    df_panel.index.name = "ts"
-    df_panel.to_parquet(os.path.join(out_dir, "panel.parquet"))
-    print(f"[panel]  wrote {len(df_panel):,} rows")
-
-    df_order = df_order.set_index("time").sort_index()
-    df_order.index.name = "ts"
-    df_order.to_parquet(os.path.join(out_dir, "orders.parquet"))
-    print(f"[orders] wrote {len(df_order):,} events")
-
-    _, trade_metric, instr2dfs_raw = parser.analyze(
-        fee_rate, pnl_hzs, save_detail=False,
-        sdate=sdate, edate=edate,
-        account_name=account_name, only_total_stats=False,
-    )
-    trade_metric.to_parquet(os.path.join(out_dir, "trade_metric.parquet"))
-
-    pnl_rows, auto_rows, fill_rows = [], [], []
-    for instr, d in instr2dfs_raw.items():
-        if "pnl" in d:
-            pnl_rows.append(d["pnl"].assign(instr=instr))
-        if "auto_corr" in d:
-            auto_rows.append(d["auto_corr"].assign(instr=instr))
-        if "fills" in d:
-            fill_rows.append(d["fills"].assign(instr=instr))
-
-    if pnl_rows:
-        pd.concat(pnl_rows).to_parquet(os.path.join(out_dir, "pnl.parquet"))
-    if auto_rows:
-        pd.concat(auto_rows).to_parquet(os.path.join(out_dir, "auto_corr.parquet"))
-    if fill_rows:
-        pd.concat(fill_rows).to_parquet(os.path.join(out_dir, "fills.parquet"))
-
-    print(f"[cache] wrote trade_metric / pnl / auto_corr / fills → {out_dir}")
-
-
-
-def parse_logs_to_parquet(logs_root, parquet_root, fee_rate, sdate, edate, suffix=".log.gz"):
-    for root, _, files in os.walk(logs_root):
-        logs = [f for f in files if f.endswith(suffix)]
-        if not logs:
-            continue
-
-        rel = os.path.relpath(root, logs_root)
-        for fn in logs:
-            lp = os.path.join(root, fn)
-            od = os.path.join(parquet_root, rel, fn[:-len(suffix)])
-            print(f"\n→ parsing {lp} → {od}")
-
-            parse_with_logparser(lp, od, fee_rate, sdate, edate)
-
 
 
 def process_directory(root, base_path, sdate, edate, fee_rate, capital, pnl_hzs, account_name, beta_dict, num_parallel_inner, suffix):
@@ -594,117 +491,40 @@ def parallel_gen_results(in_fns, sdate, edate, fee_rate, pnl_hzs=pnl_hzs, accoun
             results = list(executor.map(gen_result, in_fns_list, [sdate]*len(in_fns_list), [edate]*len(in_fns_list), [fee_rate]*len(in_fns_list), [pnl_hzs]*len(in_fns_list), [account_name]*len(in_fns_list), [beta_dict]*len(in_fns_list )))
     return results
 
-def gen_result(in_fns, sdate, edate, fee_rate,
-               pnl_hzs=pnl_hzs, account_name="bin1", beta_dict=beta_dict):
+def gen_result(in_fns, sdate, edate, fee_rate, pnl_hzs=pnl_hzs, account_name='bin1', beta_dict=beta_dict):
+    final_result = {}
+    # if in_fns is string then convert it to list
 
     try:
-        in_fns = [fn for fn in in_fns if os.path.exists(fn)]
-        in_fns.sort(key=os.path.getmtime)
-        if not in_fns:
-            print("No log files found:", in_fns)
-            return None
+        in_fns = [file for file in in_fns if os.path.exists(file)]
+        in_fns = sorted(in_fns, key=os.path.getmtime)
 
-        cache_ok = True
-        tm_frames      = []                          
-        kind_frames    = defaultdict(list)           
-        df_order_list, df_panel_list = [], []
-        order_stats = {}                            
+        if in_fns == []:
+            print('No log files found')
+            print('in_fn:', in_fns)
 
-        suffix = ".log.gz"
-        for fn in in_fns:
-            repo_root = "/home/shroy/Desktop/python1/nblg_py_common"
-            rel_dir   = pathlib.Path(fn).parent.name           
-            stem      = pathlib.Path(fn).name[:-len(suffix)]   
-            pdir      = pathlib.Path(repo_root) / "output/parquet/sim" / rel_dir / stem
+        save_details = False
 
-            paths = {
-                "trade_metric": pdir / "trade_metric.parquet",
-                "pnl"        : pdir / "pnl.parquet",
-                "auto_corr"  : pdir / "auto_corr.parquet",
-                "fills"      : pdir / "fills.parquet",
-            }
-            if not all(p.exists() for p in paths.values()):
-                cache_ok = False
-                break
-
-            tm = pd.read_parquet(paths["trade_metric"])
-            
-            if "instr" not in tm.columns:            
-                tm = tm.reset_index()               
-            tm_frames.append(tm)
-
-            for k in ("pnl", "auto_corr", "fills"):
-                kind_frames[k].append(pd.read_parquet(paths[k]))
-
-            dfo, dfp = read_order_panel_if_exist(fn, sdate, edate)
-            if dfo is None or dfp is None:
-                cache_ok = False
-                break
-            df_order_list.append(dfo)
-            df_panel_list.append(dfp)
-
-        cache_ok = False
-        # cache hit
-        if cache_ok:
-            print(f"[cache hit] loaded artefacts for {len(in_fns)} file(s)")
-
-            trade_metric = pd.concat(tm_frames, ignore_index=True)
-            print(trade_metric)
-            instr2dfs_full = defaultdict(dict)
-            for kind, frames in kind_frames.items():
-                big = pd.concat(frames)              
-                for instr, df_instr in big.groupby("instr"):
-                    instr2dfs_full[instr][kind] = (
-                        df_instr.drop(columns="instr").copy()
-                    )
-
-            return {
-                "order_stats": order_stats,          
-                "trade_metric": trade_metric.reset_index(),
-                "instr2dfs": instr2dfs_full,
-                "df_order": pd.concat(df_order_list).sort_index(),
-                "df_panel": pd.concat(df_panel_list).sort_index(),
-            }
-
-        # cache miss : fall back to original path 
-        print("[cache miss] parsing raw logs")
         parser = LogParser(in_fns, analyze_latency=True)
-        order_stats, trade_metric, instr2dfs = parser.analyze(
-            fee_rate, pnl_hzs, save_detail=False,
-            sdate=sdate, edate=edate,
-            account_name=account_name, only_total_stats=False,
-        )
+        order_stats, trade_metric, instr2dfs = parser.analyze(fee_rate, pnl_hzs, save_details, sdate, edate, account_name= account_name, only_total_stats = False)
+
+        final_result['order_stats'] = order_stats
+        final_result['trade_metric'] = trade_metric
+        final_result['instr2dfs'] = instr2dfs
+
         df_order, df_panel = parser.get_order_and_panel(sdate, edate)
-
-        return {
-            "order_stats": order_stats,
-            "trade_metric": trade_metric.reset_index(),  
-            "instr2dfs": instr2dfs,
-            "df_order": df_order,
-            "df_panel": df_panel,
-        }
-
+        final_result['df_order'] = df_order
+        final_result['df_panel'] = df_panel
+        return final_result
     except Exception as e:
-        print(f"error parsing for {in_fns} due to {e}")
+        print(f'error parsing for {in_fns} due to {e}')
         return None
 
 
-
 def analyze_slurm_sim(sdate, edate, sim_name, fee_rate=-0.3e-4, capital=1e6,
-    parent_folder="/mnt/sda/NAS/ShareFolder/bb/sim_slurm/",
-    suffix=".log.gz", num_parallel=256, output_folder="/mnt/sda/NAS/ShareFolder/bb/sim_slurm/"
-):
-    logs_root    = os.path.join(parent_folder, sim_name)
-    parquet_root = os.path.join(output_folder, sim_name)
-
-    if not os.path.isdir(parquet_root) or not os.listdir(parquet_root):
-        print(f"No parquet directory at {parquet_root}; parsing logs → parquet…")
-        os.makedirs(parquet_root, exist_ok=True)
-        parse_logs_to_parquet(logs_root, parquet_root, fee_rate, sdate=sdate, edate=edate, suffix=suffix)
-    else:
-        print(f"Parquet directory {parquet_root} exists; skipping parsing.")
-
-    folder = os.path.join(parent_folder, sim_name)
+                      parent_folder='/mnt/sda/NAS/ShareFolder/bb/sim_slurm/',
+                      suffix='.log', num_parallel=256, output_folder=f'/mnt/sda/NAS/ShareFolder/bb/sim_slurm/'):
+    folder = parent_folder + sim_name
 
     df_res = run_pta_group(folder, sdate, edate, fee_rate, capital, suffix=suffix, num_parallel=num_parallel, n_process=2)
 
@@ -769,3 +589,4 @@ if __name__ == '__main__':
 
     res = run_pta(in_fns, sdate, edate, fee_rate, capital)
     df_merged, instr2dfs = res['df_merged'], res['instr2dfs']
+
