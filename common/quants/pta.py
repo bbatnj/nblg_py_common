@@ -3,8 +3,8 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
-import gzip
-import ast
+import pathlib
+from collections import defaultdict
 
 from common.log_parser import LogParser
 
@@ -13,8 +13,6 @@ from common.miscs.html import pph
 from common.quants.corr import pair_corr, calc_auto_corr, bucket_analyze_generic
 from common.quants.pnl import sharpe, win_ratio, calc_trade_markout, n_count
 import matplotlib.pyplot as plt
-
-from common.searchParams.utils import calc_trading_metrics
 
 beta_dict = {
     'BTCUSDT.BNF': 1.0,
@@ -30,25 +28,93 @@ beta_dict = {
 
 pnl_hzs = [10, 60, 300, 1800, 7200, 1e9]
 
-def parse_with_logparser(log_path, out_dir,
-                         sdate, edate,
-                         analyze_latency=True, exchange="binance"):
+def read_order_panel_if_exist(log_path, sdate=None, edate=None):
+    REPO_ROOT    = "/home/shroy/Desktop/python1/nblg_py_common"
+    LOGS_ROOT    = os.path.join(REPO_ROOT, "common", "data_sample", "sim")
+    PARQUET_ROOT = os.path.join(REPO_ROOT, "output", "parquet", "sim")
+    LOG_SUFFIX   = ".log.gz"
+
+    rel  = pathlib.Path(log_path).parent.name          
+    stem = pathlib.Path(log_path).name[:-len(LOG_SUFFIX)]
+
+    pdir = os.path.join(PARQUET_ROOT, rel, stem)
+    panel_pq  = os.path.join(pdir, "panel.parquet")
+    orders_pq = os.path.join(pdir, "orders.parquet")
+
+    if not (os.path.exists(panel_pq) and os.path.exists(orders_pq)):
+        return None, None        
+    df_panel = pd.read_parquet(panel_pq)
+    df_order = pd.read_parquet(orders_pq)
+
+    if sdate:
+        start = pd.to_datetime(sdate)
+        end   = pd.to_datetime(edate) + pd.Timedelta("1D")
+        df_panel = df_panel.loc[start:end]
+        df_order = df_order.loc[start:end]
+
+    for _df in (df_order, df_panel):
+        _df.index.name = "ts"
+
+    return df_order, df_panel
+
+
+
+def parse_with_logparser(
+    log_path, out_dir, fee_rate,
+    sdate, edate,
+    analyze_latency=True, exchange="binance",
+    pnl_hzs=pnl_hzs, account_name="bin1",
+):
     os.makedirs(out_dir, exist_ok=True)
-    parser = LogParser([log_path],
-                       analyze_latency=analyze_latency)
+
+    targets = ["panel.parquet", "orders.parquet",
+               "trade_metric.parquet", "pnl.parquet",
+               "auto_corr.parquet", "fills.parquet"]
+    if all((pathlib.Path(out_dir) / f).exists() for f in targets):
+        print(f"[skip] all caches present → {out_dir}")
+        return
+
+    parser = LogParser([log_path], analyze_latency=analyze_latency,
+                       exchange=exchange)
     df_order, df_panel = parser.get_order_and_panel(sdate, edate)
 
     df_panel.index.name = "ts"
-    df_panel.to_parquet(f"{out_dir}/panel.parquet")
-    print(f"[panel] wrote {len(df_panel)} rows → {out_dir}/panel.parquet")
+    df_panel.to_parquet(os.path.join(out_dir, "panel.parquet"))
+    print(f"[panel]  wrote {len(df_panel):,} rows")
 
     df_order = df_order.set_index("time").sort_index()
     df_order.index.name = "ts"
-    df_order.to_parquet(f"{out_dir}/orders.parquet")
-    print(f"[orders] wrote {len(df_order)} events → {out_dir}/orders.parquet")
+    df_order.to_parquet(os.path.join(out_dir, "orders.parquet"))
+    print(f"[orders] wrote {len(df_order):,} events")
+
+    _, trade_metric, instr2dfs_raw = parser.analyze(
+        fee_rate, pnl_hzs, save_detail=False,
+        sdate=sdate, edate=edate,
+        account_name=account_name, only_total_stats=False,
+    )
+    trade_metric.to_parquet(os.path.join(out_dir, "trade_metric.parquet"))
+
+    pnl_rows, auto_rows, fill_rows = [], [], []
+    for instr, d in instr2dfs_raw.items():
+        if "pnl" in d:
+            pnl_rows.append(d["pnl"].assign(instr=instr))
+        if "auto_corr" in d:
+            auto_rows.append(d["auto_corr"].assign(instr=instr))
+        if "fills" in d:
+            fill_rows.append(d["fills"].assign(instr=instr))
+
+    if pnl_rows:
+        pd.concat(pnl_rows).to_parquet(os.path.join(out_dir, "pnl.parquet"))
+    if auto_rows:
+        pd.concat(auto_rows).to_parquet(os.path.join(out_dir, "auto_corr.parquet"))
+    if fill_rows:
+        pd.concat(fill_rows).to_parquet(os.path.join(out_dir, "fills.parquet"))
+
+    print(f"[cache] wrote trade_metric / pnl / auto_corr / fills → {out_dir}")
 
 
-def parse_logs_to_parquet(logs_root, parquet_root, sdate, edate, suffix=".log.gz"):
+
+def parse_logs_to_parquet(logs_root, parquet_root, fee_rate, sdate, edate, suffix=".log.gz"):
     for root, _, files in os.walk(logs_root):
         logs = [f for f in files if f.endswith(suffix)]
         if not logs:
@@ -60,7 +126,7 @@ def parse_logs_to_parquet(logs_root, parquet_root, sdate, edate, suffix=".log.gz
             od = os.path.join(parquet_root, rel, fn[:-len(suffix)])
             print(f"\n→ parsing {lp} → {od}")
 
-            parse_with_logparser(lp, od, sdate, edate)
+            parse_with_logparser(lp, od, fee_rate, sdate, edate)
 
 
 
@@ -528,93 +594,105 @@ def parallel_gen_results(in_fns, sdate, edate, fee_rate, pnl_hzs=pnl_hzs, accoun
             results = list(executor.map(gen_result, in_fns_list, [sdate]*len(in_fns_list), [edate]*len(in_fns_list), [fee_rate]*len(in_fns_list), [pnl_hzs]*len(in_fns_list), [account_name]*len(in_fns_list), [beta_dict]*len(in_fns_list )))
     return results
 
-def gen_result(in_fns, sdate, edate, fee_rate, pnl_hzs=pnl_hzs, account_name='bin1', beta_dict=beta_dict):
-    final_result = {}
-    # if in_fns is string then convert it to list
+def gen_result(in_fns, sdate, edate, fee_rate,
+               pnl_hzs=pnl_hzs, account_name="bin1", beta_dict=beta_dict):
 
     try:
-        in_fns = [file for file in in_fns if os.path.exists(file)]
-        in_fns = sorted(in_fns, key=os.path.getmtime)
+        in_fns = [fn for fn in in_fns if os.path.exists(fn)]
+        in_fns.sort(key=os.path.getmtime)
+        if not in_fns:
+            print("No log files found:", in_fns)
+            return None
 
-        if in_fns == []:
-            print('No log files found')
-            print('in_fn:', in_fns)
+        cache_ok = True
+        tm_frames      = []                          
+        kind_frames    = defaultdict(list)           
+        df_order_list, df_panel_list = [], []
+        order_stats = {}                            
 
-        save_details = False
+        for fn in in_fns:
+            repo_root = "/home/shroy/Desktop/python1/nblg_py_common"
+            rel_dir   = pathlib.Path(fn).parent.name           
+            stem      = pathlib.Path(fn).stem                  
+            pdir      = pathlib.Path(repo_root) / "output/parquet/sim" / rel_dir / stem
 
+            paths = {
+                "trade_metric": pdir / "trade_metric.parquet",
+                "pnl"        : pdir / "pnl.parquet",
+                "auto_corr"  : pdir / "auto_corr.parquet",
+                "fills"      : pdir / "fills.parquet",
+            }
+            if not all(p.exists() for p in paths.values()):
+                cache_ok = False
+                break
+
+            tm = pd.read_parquet(paths["trade_metric"])
+            if "instr" not in tm.columns:            
+                tm = tm.reset_index()               
+            tm_frames.append(tm)
+
+            for k in ("pnl", "auto_corr", "fills"):
+                kind_frames[k].append(pd.read_parquet(paths[k]))
+
+            dfo, dfp = read_order_panel_if_exist(fn, sdate, edate)
+            if dfo is None:
+                cache_ok = False
+                break
+            df_order_list.append(dfo)
+            df_panel_list.append(dfp)
+
+        # cache hit
+        if cache_ok:
+            print(f"[cache hit] loaded artefacts for {len(in_fns)} file(s)")
+
+            trade_metric = pd.concat(tm_frames, ignore_index=True)
+
+            instr2dfs_full = defaultdict(dict)
+            for kind, frames in kind_frames.items():
+                big = pd.concat(frames)              
+                for instr, df_instr in big.groupby("instr"):
+                    instr2dfs_full[instr][kind] = (
+                        df_instr.drop(columns="instr").copy()
+                    )
+
+            return {
+                "order_stats": order_stats,          
+                "trade_metric": trade_metric,
+                "instr2dfs": instr2dfs_full,
+                "df_order": pd.concat(df_order_list).sort_index(),
+                "df_panel": pd.concat(df_panel_list).sort_index(),
+            }
+
+        # cache miss : fall back to original path 
+        print("[cache miss] parsing raw logs")
         parser = LogParser(in_fns, analyze_latency=True)
-        order_stats, trade_metric, instr2dfs = parser.analyze(fee_rate, pnl_hzs, save_details, sdate, edate, account_name= account_name, only_total_stats = False)
-
-        final_result['order_stats'] = order_stats
-        final_result['trade_metric'] = trade_metric
-        final_result['instr2dfs'] = instr2dfs
-
+        order_stats, trade_metric, instr2dfs = parser.analyze(
+            fee_rate, pnl_hzs, save_detail=False,
+            sdate=sdate, edate=edate,
+            account_name=account_name, only_total_stats=False,
+        )
         df_order, df_panel = parser.get_order_and_panel(sdate, edate)
-        final_result['df_order'] = df_order
-        final_result['df_panel'] = df_panel
-        return final_result
+
+        return {
+            "order_stats": order_stats,
+            "trade_metric": trade_metric.reset_index(),  
+            "instr2dfs": instr2dfs,
+            "df_order": df_order,
+            "df_panel": df_panel,
+        }
+
     except Exception as e:
-        print(f'error parsing for {in_fns} due to {e}')
+        print(f"error parsing for {in_fns} due to {e}")
         return None
 
 
-
-def summarize_one_sim(sim_dir, fee_rate, pnl_hzs, account_name,sdate=None, edate=None):
-    date_dirs = sorted([
-        d for d in glob.glob(os.path.join(sim_dir, "*"))
-        if os.path.isdir(d)
-    ])
-    if not date_dirs:
-        raise RuntimeError(f"No date subdirs in {sim_dir}")
-
-    orders = pd.concat(
-        [pd.read_parquet(os.path.join(d, "orders.parquet")) for d in date_dirs],
-        axis=0
-    ).sort_index()
-    panel  = pd.concat(
-        [pd.read_parquet(os.path.join(d, "panel.parquet"))  for d in date_dirs],
-        axis=0
-    ).sort_index()
-
-    if sdate is not None:
-        start = pd.to_datetime(sdate)
-        end   = pd.to_datetime(edate) + pd.Timedelta("1D")
-        orders = orders.loc[start:end]
-        panel  = panel.loc[start:end]
-
-    metric_df, _ = calc_trading_metrics(
-        {"order": orders, "panel": panel},
-        fee_rate, pnl_hzs, account_name=account_name
-    )
-
-    df_tm = metric_df.reset_index().set_index(["instr","date"])
-    total_by_date = (
-        df_tm
-        .groupby("date")
-        .sum()                    
-        .assign(instr="Total")     
-        .reset_index()
-        .set_index(["instr","date"])
-    )
-    df_tm = pd.concat([df_tm, total_by_date])\
-              .sort_index(level=[0,1], ascending=[True, False])
-
-    basic_agg = ["sum","mean","std","min","max"]
-    extra_agg = [sharpe, win_ratio] + basic_agg
-
-    pnl_part   = df_tm[["total_pnl"]].groupby("instr").agg(extra_agg)
-    trade_part = df_tm[["notional","gross_book_mean","net_book_mean"]].groupby("instr").agg(basic_agg)
-
-    concat_df = pd.concat([pnl_part, trade_part], axis=1)
-
-    return concat_df.loc["Total"]  
 
 def analyze_slurm_sim(
     sdate, edate, sim_name,
     fee_rate=-0.3e-4,
     capital=1e6,
     parent_folder="/mnt/sda/NAS/ShareFolder/bb/sim_slurm/",
-    suffix=".log",
+    suffix=".log.gz",
     num_parallel=8,
     output_folder="/mnt/sda/NAS/ShareFolder/bb/sim_slurm/"
 ):
@@ -624,50 +702,32 @@ def analyze_slurm_sim(
     if not os.path.isdir(parquet_root) or not os.listdir(parquet_root):
         print(f"No parquet directory at {parquet_root}; parsing logs → parquet…")
         os.makedirs(parquet_root, exist_ok=True)
-        parse_logs_to_parquet(logs_root, parquet_root, sdate=sdate, edate=edate, suffix=suffix)
+        parse_logs_to_parquet(logs_root, parquet_root, fee_rate, sdate=sdate, edate=edate, suffix=suffix)
     else:
         print(f"Parquet directory {parquet_root} exists; skipping parsing.")
 
-    sim_dirs = sorted(glob.glob(os.path.join(parquet_root, "sim@*")))
-    results = {}
-    with ProcessPoolExecutor(max_workers=num_parallel) as exe:
-        futures = {
-            exe.submit(summarize_one_sim, d, fee_rate, pnl_hzs, "bin1", sdate, edate): d
-            for d in sim_dirs
-        }
-        for fut in as_completed(futures):
-            simdir = futures[fut]
-            sim     = os.path.basename(simdir)
-            results[sim] = fut.result()
+    folder = os.path.join(parent_folder, sim_name)
 
-    df_res = pd.DataFrame.from_dict(results, orient="index")
-    df_res.columns = ["_".join(col) for col in df_res.columns]
+    df_res = run_pta_group(folder, sdate, edate, fee_rate, capital, suffix=suffix, num_parallel=num_parallel, n_process=2)
 
-    df_res["te"]    = df_res["notional_mean"] / df_res["gross_book_mean_mean"]
-    df_res["score"] = (
-        df_res["total_pnl_sharpe"]
-        * (2 * df_res["total_pnl_win_ratio"] - 1)
-        * np.sqrt(1 + df_res["te"])
-    )
+    df_res = df_res.sort_index()
+    df_res.columns = ['_'.join(col) for col in df_res.columns]
+    cols = 'total_pnl_sharpe total_pnl_win_ratio total_pnl_sum total_pnl_mean total_pnl_std total_pnl_min notional_mean gross_book_mean_mean net_book_mean_mean'.split()
 
-    cols = [
-        "total_pnl_sharpe", "total_pnl_win_ratio",
-        "total_pnl_sum",    "total_pnl_mean",   
-        "total_pnl_std",    "total_pnl_min",
-        "notional_mean",    "gross_book_mean_mean", "net_book_mean_mean"
-    ]
-    df_res = df_res.sort_values("score", ascending=False)[["score"] + cols]
-
-    out_dir = os.path.join(output_folder, sim_name)
-    os.makedirs(out_dir, exist_ok=True)
-    df_res.reset_index(drop=False).to_parquet(os.path.join(out_dir, "df_res.parquet"))
-
+    print("df_res columns:", list(df_res.columns))
+    df_res['te'] = df_res.eval('notional_mean / gross_book_mean_mean')
+    df_res['score'] = df_res.eval('total_pnl_sharpe * (2 * total_pnl_win_ratio - 1) * sqrt(1+te)') #score calc
+    #df_res['score'] = df_res.eval('total_pnl_sharpe * (2 * total_pnl_win_ratio - 1) * log(1+te)') #score calc
+    df_res = df_res.sort_values('score', ascending=False)[['score'] + cols].copy() #.query('total_pnl_win_ratio >= 0.6')
+    output_folder = output_folder + f'{sim_name}'
+    os.system(f'mkdir -p {output_folder}')
+    df_res.to_parquet(f'{output_folder}/df_res.parquet')
     return df_res
 
 # def analyze_slurm_sim(sdate, edate, sim_name, fee_rate=-0.3e-4, capital=1e6,
 #                       parent_folder='/mnt/sda/NAS/ShareFolder/bb/sim_slurm/',
 #                       suffix='.log', num_parallel=256, output_folder=f'/mnt/sda/NAS/ShareFolder/bb/sim_slurm/'):
-#     folder = parent_folder + sim_name
+#     folder = os.path.join(parent_folder, sim_name)
 
 #     df_res = run_pta_group(folder, sdate, edate, fee_rate, capital, suffix=suffix, num_parallel=num_parallel, n_process=2)
 
@@ -732,4 +792,3 @@ if __name__ == '__main__':
 
     res = run_pta(in_fns, sdate, edate, fee_rate, capital)
     df_merged, instr2dfs = res['df_merged'], res['instr2dfs']
-
