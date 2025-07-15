@@ -1,0 +1,32 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE/editor settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Distribution builds
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Parquet / output folders (unless you explicitly want to check them in)
+output/
+
+# Driver code for testing
+run_analysis.py
