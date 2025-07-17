@@ -238,4 +238,3 @@ def calc_trading_metrics(dict_df, fee_rate, Ts_in_sec=[20, 60, 180, 600, 1800, 1
 
 
 
-
