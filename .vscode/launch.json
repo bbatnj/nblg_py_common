@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Debug common.test",
+      "type": "python",
+      "request": "launch",
+      "module": "common.test",        // <-- runs `-m common.test`
+      "cwd": "${workspaceFolder}",    // your repo root
+      "justMyCode": true
+    }
+  ]
+}

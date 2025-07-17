@@ -139,7 +139,7 @@ def pph_pta(output):
     pph(None, 'Markout Analysis', show_result=show_result)
     pph(output['Markout_Analysis'].T, 'Markout Analysis', show_result=show_result)
     pph(output['Markout_by_Kind'], 'Markout by Kind', show_result=show_result)
-
+    pph(output['Gap_Analysis'], 'Gap on fills' , show_result=show_result)
     for instr in output['bu_markout']:
         per_instr_bin_markout = output['bu_markout'][instr]
         n = per_instr_bin_markout[0].shape[0]
@@ -418,6 +418,7 @@ def gen_pta_output(in_fns, sdate, edate, fee_rate, input_capital=1000, pnl_hzs=p
 
     markout_dict = {}
     df_markout_by_kind = {}
+    gap_stats_dict = {}
     for instr in instr2df_markout:
         # pph(None, instr + ' Markout Analysis', level=4, show_result=show_result)
         df_markout = instr2df_markout[instr]
@@ -437,6 +438,15 @@ def gen_pta_output(in_fns, sdate, edate, fee_rate, input_capital=1000, pnl_hzs=p
         df_markout['bu2_bin'] = pd.qcut(bu_df['bu2'] / bu_df['rv'], 3)
         df_markout['bu3_bin'] = pd.qcut(bu_df['bu3'] / bu_df['rv'], 3)
 
+        if not bu_df.empty and {'mid', 'price', 'side'}.issubset(bu_df.columns):
+            gap = ((bu_df['mid'] - bu_df['price']) / bu_df['mid'] * bu_df['side']).dropna()
+            if not gap.empty:
+                stats = gap.agg(['mean', 'median']).to_dict()
+                stats['10%'] = gap.quantile(0.1)
+                stats['20%'] = gap.quantile(0.2)
+                stats['80%'] = gap.quantile(0.8)
+                stats['90%'] = gap.quantile(0.9)
+                gap_stats_dict[instr] = stats
 
         markout_res_cols = [c for c in df_markout if 'markout' in c and 'adj' not in c]
         agg_funcs = [win_ratio, 'median', 'mean', 'std', n_count]
@@ -470,6 +480,8 @@ def gen_pta_output(in_fns, sdate, edate, fee_rate, input_capital=1000, pnl_hzs=p
 
         # print('================================================================')
 
+    gap_df = (pd.DataFrame(gap_stats_dict).T[['mean', 'median', '10%', '20%', '80%', '90%']].sort_index())
+    output['Gap_Analysis'] = gap_df
     output['Markout_Analysis'] = pd.concat(markout_dict, axis=1).T
     output['Markout_by_Kind'] = pd.concat(df_markout_by_kind, axis=1)
 
@@ -589,4 +601,3 @@ if __name__ == '__main__':
 
     res = run_pta(in_fns, sdate, edate, fee_rate, capital)
     df_merged, instr2dfs = res['df_merged'], res['instr2dfs']
-
