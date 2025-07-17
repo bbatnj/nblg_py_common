@@ -24,3 +24,5 @@ done
 esac
 FETCH_HEAD
 git
+
+.vscode/
